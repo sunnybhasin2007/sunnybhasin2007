@@ -196,11 +196,16 @@ an unregistered index through the agent's ES|QL tool.
 Failed alerts are retried up to 3 times; overlapping runs are dropped, so no alert is processed twice.
 
 ```bash
-python setup_alert_rca.py deploy --alert-index <your-alert-index> --alert-time-field @timestamp \
-    --kibana-url https://kibana.mycorp.local:5601
+python setup_alert_rca.py deploy --alert-index alert_details --component-field <field> \
+    --agent-id component-agent --components-index component-registry --shards 4 \
+    --group-window now-5m --kibana-url https://kibana.mycorp.local:5601
 python setup_alert_rca.py status      # last runs + latest results with case links
 python setup_alert_rca.py run-now | disable | enable
 ```
+The component is read from the alert's `--component-field` and matched (case-insensitive)
+against the component table's `component` / `aliases`; the agent is only asked when that
+fails, and alerts for components that are not registered still get a case
+(`unregistered:<name>`). `--shards N` runs N copies in parallel, split by component.
 The workflow runs with the privileges of the user who deploys it.
 
 ## Files
@@ -212,6 +217,7 @@ config/agent.yaml          agent name, index names, tool prefix, role features
 config/query_templates.yaml  ES|QL templates and OTel/ECS field presets
 config/components.example.csv, config/checks.example.yaml   examples
 workflows/alert_rca.yaml   alert -> RCA -> Kibana Case workflow
+devtools/component_agent.txt   minimal component agent for Dev Tools (case-insensitive lookup)
 setup_alert_rca.py         deploy / status / run-now for that workflow
 ```
 

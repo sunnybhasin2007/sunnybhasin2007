@@ -1,29 +1,34 @@
 version: '1'
 name: Alert root-cause analysis
 description: >-
-  Every minute: picks up new alerts from the alert index, identifies the
-  component with the App Health Agent, runs a root-cause analysis on that
-  component's indices, stores the result in the RCA index and opens (or
-  updates) a Kibana Case. Repeat alerts for the same component within the
-  grouping window are added to the open case instead of starting a new RCA.
+  Every minute: picks up new alerts from the alert index, resolves the component
+  (from the alert's component field via the component table, the agent only as a
+  fallback), runs a root-cause analysis on that component's indices with the App
+  Health Agent, opens a Kibana Case and stores the result in the RCA index.
+  Repeat alerts for the same component within the grouping window are added to
+  its open case instead of starting a new RCA.
 enabled: true
 tags: [app-health, rca]
 
 settings:
   timeout: 50m
-  concurrency:            # a run still busy with a slow RCA makes the next scheduled run skip
-    key: alert-rca
+  concurrency:            # a run still busy with slow RCAs makes this shard's next run skip
+    key: alert-rca-shard-0
     strategy: drop
     max: 1
 
-# ---------------------------------------------------------------- edit these ---
+# ------------------------------------------ set by setup_alert_rca.py deploy ---
 consts:
-  alert_index: alerts-logstash      # index / data stream / pattern Logstash writes alerts to
-  alert_time_field: '@timestamp'    # alert time field in that index
+  alert_index: alert_details        # index pattern behind your alert data view
+  alert_time_field: '@timestamp'    # alert time field
+  component_field: CHANGE_ME        # field holding the component name in each alert
   rca_index: alert-rca              # results index (created by setup_alert_rca.py)
+  components_index: component-registry   # your component table (fields: component, aliases, indices)
   lookback_minutes: 120             # only alerts newer than this are picked up
-  batch_size: 5                     # alerts handled per run
-  group_window: now-30m             # repeat alerts for a component within this window join its open case
+  batch_size: 5                     # alerts handled per run and shard
+  group_window: now-5m              # repeat alerts for a component within this window join its open case
+  shard_index: 0                    # this copy handles components whose hash % shard_count == shard_index
+  shard_count: 1
   kibana_url: https://kibana.example.local:5601   # used for links in the case
 
 triggers:
@@ -33,30 +38,34 @@ triggers:
   - type: manual
 
 steps:
-  # 1. New alerts = alerts that have no row in the RCA index yet (or whose earlier
-  #    attempt failed / got stuck), found with an ES|QL LOOKUP JOIN.
+  # 1. This shard's new alerts: no row in the RCA index yet (or an earlier attempt
+  #    failed / got stuck), found with an ES|QL LOOKUP JOIN. Sharding is by component,
+  #    so all alerts of one component go to the same shard and group correctly.
   - name: find_new_alerts
     type: elasticsearch.esql.query
     with:
       query: |
         FROM {{ consts.alert_index }} METADATA _id, _index
         | WHERE {{ consts.alert_time_field }} >= NOW() - {{ consts.lookback_minutes }} minutes
-        | EVAL alert_id = _id, alert_ts = {{ consts.alert_time_field }}
+        | EVAL alert_id = _id, alert_ts = {{ consts.alert_time_field }},
+               comp_value = COALESCE(TO_LOWER(TO_STRING({{ consts.component_field }})), "")
+        | EVAL shard = (LOCATE("0123456789abcdef", SUBSTRING(HASH("md5", comp_value), 1, 1)) - 1) % {{ consts.shard_count }}
+        | WHERE shard == {{ consts.shard_index }}
         | LOOKUP JOIN {{ consts.rca_index }} ON alert_id
         | WHERE rca_status IS NULL
             OR (rca_status == "failed" AND attempts < 3)
             OR (rca_status == "processing" AND claimed_at < NOW() - 30 minutes)
         | EVAL attempts = COALESCE(attempts, 0)
         | SORT alert_ts ASC
-        | KEEP alert_id, _index, alert_ts, attempts
+        | KEEP alert_id, _index, alert_ts, attempts, comp_value
         | LIMIT {{ consts.batch_size }}
 
   - name: each_alert
     type: foreach
     foreach: '{{ steps.find_new_alerts.output.values }}'
-    # item[0]=alert_id  item[1]=_index  item[2]=alert time  item[3]=attempts
-    # (alert time is named alert_ts in the query: LOOKUP JOIN would overwrite a column
-    #  that also exists in the RCA index)
+    # item[0]=alert_id item[1]=_index item[2]=alert time item[3]=attempts item[4]=component (lower case)
+    # (the query names them alert_ts / comp_value on purpose: LOOKUP JOIN overwrites any
+    #  column whose name also exists in the RCA index)
     iteration-on-failure:
       continue: true
       fallback:
@@ -70,13 +79,14 @@ steps:
               alert_id: '{{ foreach.item[0] }}'
               alert_index: '{{ foreach.item[1] }}'
               alert_time: '{{ foreach.item[2] }}'
+              alert_component: '{{ foreach.item[4] }}'
               rca_status: failed
               attempts: '{{ foreach.item[3] | plus: 1 }}'
               error: '{{ error | json }}'
               processed_at: '{{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}'
               workflow_execution_id: '{{ execution.id }}'
     steps:
-      # 2. Claim the alert so a parallel/next run never processes it twice.
+      # 2. Claim the alert so no other run processes it at the same time.
       - name: claim
         type: elasticsearch.index
         with:
@@ -87,6 +97,7 @@ steps:
             alert_id: '{{ foreach.item[0] }}'
             alert_index: '{{ foreach.item[1] }}'
             alert_time: '{{ foreach.item[2] }}'
+            alert_component: '{{ foreach.item[4] }}'
             rca_status: processing
             attempts: '{{ foreach.item[3] | plus: 1 }}'
             claimed_at: '{{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}'
@@ -101,26 +112,49 @@ steps:
             ids:
               values: ['{{ foreach.item[0] }}']
 
-      # 3. Which component is it? (cheap call: lookup only, no analysis)
+      # 3. Resolve the component: exact match of the alert's component value on the
+      #    component table's id or aliases; only if that fails, ask the agent.
+      - name: lookup_component
+        type: elasticsearch.search
+        with:
+          index: '{{ consts.components_index }}'
+          size: 1
+          query:
+            bool:
+              minimum_should_match: 1
+              should:   # case-insensitive; .keyword covers dynamically mapped (text) tables
+                - term: { component: { value: '{{ foreach.item[4] }}', case_insensitive: true } }
+                - term: { component.keyword: { value: '{{ foreach.item[4] }}', case_insensitive: true } }
+                - term: { aliases: { value: '{{ foreach.item[4] }}', case_insensitive: true } }
+                - term: { aliases.keyword: { value: '{{ foreach.item[4] }}', case_insensitive: true } }
+
       - name: identify
         type: ai.agent
         agent-id: app-health-agent
+        if: 'steps.lookup_component.output.hits.total.value : 0'
         with:
           message: |
-            An alert was raised. Your ONLY task: identify which component from the component
-            table this alert belongs to. Call apphealth.list_components and match the alert's
-            names, aliases, hosts, services or topics. Do not run any analysis queries.
-            If nothing matches, return component "unknown".
+            An alert names the component "{{ foreach.item[4] }}", which is not an exact id or alias
+            in the component table. Your ONLY task: use your component lookup tool and decide which
+            registered component this alert belongs to (spelling variants, environment suffixes,
+            hosts, services). Do not run any analysis queries. If none fits, return "unknown".
 
             Alert (JSON): {{ steps.get_alert.output.hits.hits[0]._source | json }}
           schema:
             type: object
             properties:
-              component: { type: string, description: 'component id from list_components, or "unknown"' }
+              component: { type: string, description: 'registered component name exactly as stored, or "unknown"' }
               matched_on: { type: string, description: 'what in the alert matched' }
             required: [component, matched_on]
 
-      # 4. Is there already an open RCA case for this component in the grouping window?
+      - name: resolve
+        type: data.set
+        with:
+          # registered component id, or "unregistered:<name in the alert>"
+          component: >-
+            {% assign c = steps.lookup_component.output.hits.hits[0]._source.component | default: steps.identify.output.structured_output.component | default: 'unknown' %}{% if c == 'unknown' %}unregistered:{{ foreach.item[4] | default: 'none' }}{% else %}{{ c }}{% endif %}
+
+      # 4. Is there already an RCA case for this component in the grouping window?
       - name: open_case
         type: elasticsearch.search
         with:
@@ -130,7 +164,7 @@ steps:
           query:
             bool:
               filter:
-                - term: { component: '{{ steps.identify.output.structured_output.component }}' }
+                - term: { component: '{{ variables.component }}' }
                 - term: { rca_status: case_opened }
                 - range: { processed_at: { gte: '{{ consts.group_window }}' } }
 
@@ -144,11 +178,10 @@ steps:
             with:
               case_id: '{{ steps.open_case.output.hits.hits[0]._source.case_id }}'
               comment: |
-                **Related alert grouped into this case** ({{ steps.identify.output.structured_output.component }})
+                **Related alert grouped into this case** ({{ variables.component }})
 
                 - Alert time: {{ foreach.item[2] }}
                 - Alert id: `{{ foreach.item[0] }}` in `{{ foreach.item[1] }}`
-                - Matched on: {{ steps.identify.output.structured_output.matched_on }}
 
                 ```json
                 {{ steps.get_alert.output.hits.hits[0]._source | json }}
@@ -163,16 +196,18 @@ steps:
                 alert_id: '{{ foreach.item[0] }}'
                 alert_index: '{{ foreach.item[1] }}'
                 alert_time: '{{ foreach.item[2] }}'
+                alert_component: '{{ foreach.item[4] }}'
                 alert_source: '{{ steps.get_alert.output.hits.hits[0]._source | json }}'
-                component: '{{ steps.identify.output.structured_output.component }}'
+                component: '{{ variables.component }}'
                 rca_status: grouped
                 case_id: '{{ steps.open_case.output.hits.hits[0]._source.case_id }}'
+                case_url: '{{ steps.open_case.output.hits.hits[0]._source.case_url }}'
                 grouped_into_alert_id: '{{ steps.open_case.output.hits.hits[0]._source.alert_id }}'
                 attempts: '{{ foreach.item[3] | plus: 1 }}'
                 processed_at: '{{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}'
                 workflow_execution_id: '{{ execution.id }}'
         else:
-          # 5b. New problem: full root-cause analysis on the component's own indices.
+          # 5b. New problem: root-cause analysis on the component's own indices.
           - name: rca
             type: ai.agent
             agent-id: app-health-agent
@@ -180,46 +215,48 @@ steps:
             timeout: 10m
             with:
               message: |
-                Root-cause analysis for an alert. Follow your root cause analysis workflow.
+                Root-cause analysis for an alert.
 
-                Component: {{ steps.identify.output.structured_output.component }}
-                (if "unknown": say no registered component matches, set confidence "low" and do not query any index)
-                Alert time: {{ foreach.item[2] }}
-                Current time: {{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}
+                Component: {{ variables.component }}
+                If it starts with "unregistered:", no registered component matches this alert:
+                do NOT query any index; say so in root_cause, set confidence "low",
+                still_ongoing false, ongoing_evidence "unknown - component not registered",
+                and recommend registering the component in the component table.
 
-                Time windows:
-                - Cause: from 30 minutes before the alert time until now. Use {MINUTES} =
-                  (minutes between alert time and current time) + 30.
-                - Still ongoing?: re-run log_health / trace_summary / custom checks with {MINUTES} = 15
-                  and compare with the alert period.
-
-                Only query the indices of this component and of its depends_on components.
+                Otherwise:
+                1. Look the component up with your component lookup tool and use ONLY the
+                   indices it returns (plus those of components it depends on, if listed).
+                2. Alert time: {{ foreach.item[2] }}   Current time: {{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}
+                   Cause: analyse from 30 minutes before the alert time until now - errors,
+                   error rate, latency, volume changes and silent hosts, and when they started.
+                3. Still ongoing?: compare the last 15 minutes with the alert period.
+                4. Every query must have a time filter and a LIMIT. Base every statement on
+                   query results and name the index each fact came from.
 
                 Alert (JSON): {{ steps.get_alert.output.hits.hits[0]._source | json }}
               schema:
                 type: object
                 properties:
-                  component: { type: string }
                   summary: { type: string, description: 'one-line summary for the case title' }
                   root_cause: { type: string, description: 'most likely root cause, with numbers, hosts and times' }
                   evidence: { type: array, items: { type: string }, description: 'facts from query results, each naming the query/index' }
-                  still_ongoing: { type: boolean, description: true if the problem is visible in the last 15 minutes }
+                  still_ongoing: { type: boolean, description: 'true if the problem is visible in the last 15 minutes' }
                   ongoing_evidence: { type: string }
                   confidence: { type: string, enum: [high, medium, low] }
                   severity: { type: string, enum: [low, medium, high, critical] }
                   recommended_actions: { type: array, items: { type: string } }
                   indices_checked: { type: array, items: { type: string } }
-                required: [component, summary, root_cause, evidence, still_ongoing, ongoing_evidence, confidence, severity, recommended_actions, indices_checked]
+                required: [summary, root_cause, evidence, still_ongoing, ongoing_evidence, confidence, severity, recommended_actions, indices_checked]
 
           - name: create_case
             type: cases.createCase
             with:
               owner: observability          # literal: cases | observability | securitySolution
-              title: '[RCA] {{ steps.rca.output.structured_output.component }}: {{ steps.rca.output.structured_output.summary }}'
+              title: '[RCA] {{ variables.component }}: {{ steps.rca.output.structured_output.summary }}'
               severity: high                # literal; the AI's severity goes into a tag
               tags:
                 - alert-rca
-                - 'component:{{ steps.rca.output.structured_output.component }}'
+                - 'component:{{ variables.component }}'
                 - 'ai-severity:{{ steps.rca.output.structured_output.severity }}'
                 - 'ongoing:{{ steps.rca.output.structured_output.still_ongoing }}'
               settings:
@@ -239,6 +276,7 @@ steps:
                 {% endfor %}
                 ## Alert
                 - Time: {{ foreach.item[2] }}
+                - Component in alert: `{{ foreach.item[4] }}` (resolved to `{{ variables.component }}`)
                 - Alert id: `{{ foreach.item[0] }}` in `{{ foreach.item[1] }}`
                 - Indices checked: {{ steps.rca.output.structured_output.indices_checked | join: ', ' }}
                 - Agent conversation: {{ consts.kibana_url }}/app/agent_builder/conversations/{{ steps.rca.output.conversation_id }}
@@ -258,8 +296,9 @@ steps:
                 alert_id: '{{ foreach.item[0] }}'
                 alert_index: '{{ foreach.item[1] }}'
                 alert_time: '{{ foreach.item[2] }}'
+                alert_component: '{{ foreach.item[4] }}'
                 alert_source: '{{ steps.get_alert.output.hits.hits[0]._source | json }}'
-                component: '{{ steps.rca.output.structured_output.component }}'
+                component: '{{ variables.component }}'
                 rca_status: case_opened
                 case_id: '{{ steps.create_case.output.case.id }}'
                 case_url: '{{ consts.kibana_url }}/app/observability/cases/{{ steps.create_case.output.case.id }}'

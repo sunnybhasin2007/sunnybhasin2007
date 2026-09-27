@@ -1,0 +1,35 @@
+# Minimal "component agent" - paste into Kibana > Dev Tools > Console.
+# Component table: component-registry, one document per component:
+#   { "component": "MDSG", "aliases": ["MDSG", "mdsg-prod"], "indices": ["logs-generic.otel-mdsg", ...] }
+# Names/aliases can be in any case: the lookup is case-insensitive (verified on 9.4.6).
+
+# ---- Tool: look up a component's indices (use PUT .../registry.component_indices to update an existing one,
+#      body without "id" and "type")
+POST kbn:/api/agent_builder/tools
+{
+  "id": "registry.component_indices",
+  "type": "esql",
+  "description": "Returns the indices that hold a component's logs, metrics and traces. Call this FIRST for any question about a component. Matching is case-insensitive on the component name and its aliases.",
+  "configuration": {
+    "query": "FROM component-registry | WHERE TO_LOWER(component) == TO_LOWER(?component) OR MV_CONTAINS(TO_LOWER(aliases), TO_LOWER(?component)) | KEEP component, aliases, indices | LIMIT 1",
+    "params": {
+      "component": { "type": "string", "description": "Component name or alias exactly as the user wrote it (any case)" }
+    }
+  }
+}
+
+# ---- Agent
+POST kbn:/api/agent_builder/agents
+{
+  "id": "component-agent",
+  "name": "Component Agent",
+  "description": "Answers questions about a component using only that component's indices.",
+  "configuration": {
+    "instructions": "For any question about a component: 1) call registry.component_indices with the component name; if nothing is found, say so. 2) Answer using ONLY the indices it returns: check their fields with platform.core.get_index_mapping, then query with platform.core.execute_esql (always a time filter and a LIMIT). Never query any other index and never search the whole cluster. 3) Quote the numbers, hosts and times you found, and say which indices you used.",
+    "tools": [{ "tool_ids": ["registry.component_indices", "platform.core.get_index_mapping", "platform.core.execute_esql"] }]
+  }
+}
+
+# ---- Check the tool directly (should return MDSG's indices)
+POST kbn:/api/agent_builder/tools/_execute
+{ "tool_id": "registry.component_indices", "tool_params": { "component": "mdsg" } }
