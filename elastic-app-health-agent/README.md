@@ -180,6 +180,29 @@ read other indices. Re-run `role` after adding components with new index pattern
 I checked this on 9.4.6: a user with this role got `Unknown index` when querying
 an unregistered index through the agent's ES|QL tool.
 
+## Automatic root-cause analysis for every new alert (Elastic Workflows)
+
+`workflows/alert_rca.yaml` is an Elastic Workflow (Kibana 9.4, Enterprise licence) that runs every minute:
+
+1. finds alerts in your alert index that have no result yet (ES|QL `LOOKUP JOIN` against `alert-rca`),
+2. asks `app-health-agent` which component the alert is for,
+3. if that component already has an RCA case opened within the grouping window (default 30 min):
+   adds the alert to that case as a comment;
+   otherwise: runs a full RCA with the agent (only that component's indices, alert time vs now,
+   "still ongoing?") and opens a **Kibana Case** with the result,
+4. writes one row per alert to `alert-rca` (component, root cause, evidence, still_ongoing,
+   confidence, case_id, case_url, agent conversation id, status).
+
+Failed alerts are retried up to 3 times; overlapping runs are dropped, so no alert is processed twice.
+
+```bash
+python setup_alert_rca.py deploy --alert-index <your-alert-index> --alert-time-field @timestamp \
+    --kibana-url https://kibana.mycorp.local:5601
+python setup_alert_rca.py status      # last runs + latest results with case links
+python setup_alert_rca.py run-now | disable | enable
+```
+The workflow runs with the privileges of the user who deploys it.
+
 ## Files
 ```
 components.py              manage the component table (CLI)
@@ -188,6 +211,8 @@ apphealth_lib.py           shared code: pipeline, mappings, HTTP client
 config/agent.yaml          agent name, index names, tool prefix, role features
 config/query_templates.yaml  ES|QL templates and OTel/ECS field presets
 config/components.example.csv, config/checks.example.yaml   examples
+workflows/alert_rca.yaml   alert -> RCA -> Kibana Case workflow
+setup_alert_rca.py         deploy / status / run-now for that workflow
 ```
 
 ## Troubleshooting
