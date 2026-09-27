@@ -1,0 +1,153 @@
+# ES|QL query templates. The ingest pipeline on the components index renders these
+# into ready-to-run queries for every component (stored under `queries.<name>`).
+#
+# Placeholders filled in per component when the row is written:
+#   {INDICES}  the component's indices for that signal (comma separated)
+#   {WHERE}    time filter + the component's filter for that signal
+#   {TS} {HOST} {MSG} {ERROR} {WARNING} {TRACE_FIELD}   field names / conditions for the schema
+# Placeholders the AGENT fills in at question time:
+#   {MINUTES}  lookback window in minutes (inside {WHERE})
+#   {TEXT}     text to search for          {TRACE_ID} a trace id
+#
+# After editing this file run:  python components.py init && python components.py rerender
+
+# Field defaults per schema. Any of these can be overridden per component row.
+presets:
+  otel:            # OpenTelemetry native data in Elastic (logs-*.otel-*, traces-*.otel-*)
+    timestamp_field: "@timestamp"
+    host_field: resource.attributes.host.name
+    message_field: body.text
+    service_field: resource.attributes.service.name
+    error_condition: severity_number >= 17          # ERROR(17-20), FATAL(21-24)
+    warning_condition: severity_number >= 13 AND severity_number < 17
+    trace_id_field: trace_id
+  ecs:             # Elastic Common Schema (Filebeat / Elastic APM agents)
+    timestamp_field: "@timestamp"
+    host_field: host.name
+    message_field: message
+    service_field: service.name
+    error_condition: TO_LOWER(log.level) IN ("error", "fatal", "critical", "severe")
+    warning_condition: TO_LOWER(log.level) IN ("warn", "warning")
+    trace_id_field: trace.id
+
+templates:
+  # ------------------------------------------------------------------ logs --
+  log_health:
+    signal: log
+    purpose: Health per host - events, errors, warnings, error rate, minutes since last log line.
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE}
+      | EVAL is_error = CASE(({ERROR}), 1, 0), is_warning = CASE(({WARNING}), 1, 0)
+      | STATS total_events = COUNT(*), errors = SUM(is_error), warnings = SUM(is_warning), last_event = MAX({TS}) BY {HOST}
+      | EVAL error_rate_pct = ROUND(errors * 100.0 / total_events, 2), minutes_since_last_event = DATE_DIFF("minute", last_event, NOW())
+      | SORT errors DESC
+      | LIMIT 100
+  log_errors:
+    signal: log
+    purpose: Top error messages grouped by pattern, with first/last seen and affected hosts.
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE}
+      | WHERE ({ERROR})
+      | EVAL error_pattern = SUBSTRING(TO_STRING({MSG}), 1, 200)
+      | STATS occurrences = COUNT(*), first_seen = MIN({TS}), last_seen = MAX({TS}), affected_hosts = COUNT_DISTINCT({HOST}) BY error_pattern
+      | SORT occurrences DESC
+      | LIMIT 25
+  log_timeline:
+    signal: log
+    purpose: Events / errors / warnings per 5 minutes - shows when a problem started. Keep MINUTES <= 1440.
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE}
+      | EVAL is_error = CASE(({ERROR}), 1, 0), is_warning = CASE(({WARNING}), 1, 0)
+      | STATS events = COUNT(*), errors = SUM(is_error), warnings = SUM(is_warning) BY bucket = BUCKET({TS}, 5 minutes)
+      | SORT bucket ASC
+      | LIMIT 500
+  log_search:
+    signal: log
+    purpose: Latest log lines containing TEXT (an exception name, id, topic, host...).
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE} AND MATCH({MSG}, "{TEXT}")
+      | KEEP {TS}, {HOST}, {MSG}
+      | SORT {TS} DESC
+      | LIMIT 20
+  log_by_trace:
+    signal: log
+    purpose: All log lines of one trace (use a trace id found in trace_errors).
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE} AND {TRACE_FIELD} == "{TRACE_ID}"
+      | KEEP {TS}, {HOST}, {MSG}
+      | SORT {TS} ASC
+      | LIMIT 100
+
+  # --------------------------------------------------------------- metrics --
+  metric_freshness:
+    signal: metric
+    purpose: Are metrics still arriving? Docs and minutes since last doc per index.
+    query: |
+      FROM {INDICES} METADATA _index
+      | WHERE {WHERE}
+      | STATS docs = COUNT(*), last_doc = MAX({TS}) BY _index
+      | EVAL minutes_since_last_doc = DATE_DIFF("minute", last_doc, NOW())
+      | SORT minutes_since_last_doc DESC
+      | LIMIT 50
+
+  # ---------------------------------------------------------------- traces --
+  trace_summary:
+    signal: trace
+    purpose: Per operation - calls, errors, error rate, avg and p95 latency in ms.
+    schema: otel
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE}
+      | EVAL is_error = CASE(status.code == "Error", 1, 0)
+      | STATS calls = COUNT(*), errors = SUM(is_error), avg_ms = ROUND(AVG(duration) / 1000000.0, 1), p95_ms = ROUND(PERCENTILE(duration, 95) / 1000000.0, 1) BY name, kind
+      | EVAL error_rate_pct = ROUND(errors * 100.0 / calls, 2)
+      | SORT errors DESC, p95_ms DESC
+      | LIMIT 25
+  trace_errors:
+    signal: trace
+    purpose: Failing spans with an example trace id (use it with log_by_trace).
+    schema: otel
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE} AND status.code == "Error"
+      | STATS failures = COUNT(*), first_seen = MIN({TS}), last_seen = MAX({TS}), example_trace_id = MAX(trace_id) BY name, kind
+      | SORT failures DESC
+      | LIMIT 25
+  trace_timeline:
+    signal: trace
+    purpose: Calls, errors and p95 latency per 5 minutes. Keep MINUTES <= 1440.
+    schema: otel
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE}
+      | EVAL is_error = CASE(status.code == "Error", 1, 0)
+      | STATS calls = COUNT(*), errors = SUM(is_error), p95_ms = ROUND(PERCENTILE(duration, 95) / 1000000.0, 1) BY bucket = BUCKET({TS}, 5 minutes)
+      | SORT bucket ASC
+      | LIMIT 500
+  trace_summary_ecs:
+    signal: trace
+    purpose: Per transaction - calls, failures, error rate, avg and p95 latency in ms.
+    schema: ecs
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE} AND processor.event == "transaction"
+      | EVAL is_error = CASE(event.outcome == "failure", 1, 0)
+      | STATS calls = COUNT(*), errors = SUM(is_error), avg_ms = ROUND(AVG(transaction.duration.us) / 1000.0, 1), p95_ms = ROUND(PERCENTILE(transaction.duration.us, 95) / 1000.0, 1) BY transaction.name
+      | EVAL error_rate_pct = ROUND(errors * 100.0 / calls, 2)
+      | SORT errors DESC, p95_ms DESC
+      | LIMIT 25
+  trace_errors_ecs:
+    signal: trace
+    purpose: Failing transactions/spans with an example trace id.
+    schema: ecs
+    query: |
+      FROM {INDICES}
+      | WHERE {WHERE} AND event.outcome == "failure"
+      | STATS failures = COUNT(*), first_seen = MIN({TS}), last_seen = MAX({TS}), example_trace_id = MAX(trace.id) BY processor.event, transaction.name, span.name
+      | SORT failures DESC
+      | LIMIT 25

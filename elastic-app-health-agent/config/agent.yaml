@@ -1,26 +1,32 @@
-# Agent-level settings for the Kibana Agent Builder agent.
-kibana_space: default            # Kibana space the agent + tools are created in
+# Settings for the App Health Agent (Kibana Agent Builder, Elastic 9.4).
+kibana_space: default
+
 agent:
   id: app-health-agent
   name: App Health Agent
   description: >-
-    Checks health, finds issues and performs root-cause analysis for a named
-    application, using only the Elasticsearch indices registered for that app.
+    Health checks, issue finding and root-cause analysis for a named application
+    or component, using only the logs, metrics and traces indices registered for
+    it in the component table.
   avatar_color: "#54B399"
   avatar_symbol: AH
   labels: [observability, app-health]
 
-registry_index: app-health-registry   # small index holding the app -> indices catalog
-tool_prefix: apphealth               # every generated tool id starts with this
+# The component table (one row per component) and custom checks.
+components_index: app-health-components
+checks_index: app-health-checks
+default_schema: otel             # otel | ecs; can be overridden per component row
+
+tool_prefix: apphealth
 default_lookback_minutes: 60
 
-# Extra built-in platform tools given to the agent.
-# platform.core.execute_esql / get_index_mapping let the agent run ad-hoc ES|QL
-# for deeper RCA. The instructions restrict it to registered indices, but the
-# LLM *can* technically query any index the user can read. For hard
-# enforcement, give chat users the generated role (see README, step 5).
-# Leave out platform.core.search and platform.core.list_indices: those are the
-# tools that encourage cluster-wide searching.
-extra_platform_tools:
+# Built-in tools the agent may use. execute_esql runs the stored queries.
+# Do NOT add platform.core.search / platform.core.list_indices (cluster-wide search).
+platform_tools:
   - platform.core.execute_esql
   - platform.core.get_index_mapping
+
+# Kibana feature privileges granted by `components.py role`.
+role_kibana_features:
+  agentBuilder: [read]
+  actions: [read]

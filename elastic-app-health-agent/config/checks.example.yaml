@@ -1,0 +1,12 @@
+# Custom checks per component. {MINUTES} is replaced by the agent's lookback window.
+# Import with:  python components.py import-checks config/checks.example.yaml
+kafka:
+  - id: consumer_lag
+    description: Consumer lag per consumer group and topic. High or growing lag = consumers falling behind.
+    query: |
+      FROM metrics-kafka.otel-*
+      | WHERE @timestamp >= NOW() - {MINUTES} minutes AND resource.attributes.service.name == "kafka"
+      | STATS max_lag = MAX(metrics.kafka.consumer_group.lag), avg_lag = ROUND(AVG(metrics.kafka.consumer_group.lag)), last_seen = MAX(@timestamp)
+          BY attributes.group, attributes.topic
+      | SORT max_lag DESC
+      | LIMIT 25

@@ -1,336 +1,156 @@
 #!/usr/bin/env python3
-"""Generate and deploy an application-scoped health agent for Kibana Agent Builder.
+"""Deploy the App Health Agent to Kibana Agent Builder (Elastic 9.4).
 
-Reads config/apps.yaml (app -> indices catalog) and config/agent.yaml, then:
-  * writes an app registry index in Elasticsearch,
-  * creates one set of index-scoped tools per application,
-  * creates/updates an agent whose instructions force it to resolve the
-    application first and only query that application's indices.
+The agent has three small tools that read the component table
+(see components.py) plus the built-in ES|QL tool. It never gets per-application
+tools, so adding applications only means adding rows to the table.
 
-Commands:
-  render   write everything to ./out (JSON + a Kibana Dev Tools script); no network
-  apply    create/update registry, tools and agent (removes stale generated tools)
-  test     execute every generated tool once and report errors
-  ask      send a question to the agent, e.g.  ask "health of kafka"
-  destroy  delete the agent, generated tools and the registry index
+  render   write out/ (tools, agent, instructions) + out/devtools_console.txt; no network
+  apply    create/update the tools and the agent in Kibana
+  test     execute the agent's table tools once through Kibana
+  ask      ask the agent a question:  ask "how healthy is kafka?"
+  destroy  delete the agent and its tools (the component table is kept)
 
-Connection (environment variables):
-  KIBANA_URL        e.g. https://kibana.example.local:5601
-  ES_URL            e.g. https://es.example.local:9200
-  ELASTIC_API_KEY   base64 "id:key" API key            (or)
-  ELASTIC_USERNAME / ELASTIC_PASSWORD
-  ELASTIC_CA_CERT   path to CA bundle for on-prem TLS (optional)
+Connection: KIBANA_URL, ES_URL, ELASTIC_API_KEY (or ELASTIC_USERNAME/ELASTIC_PASSWORD),
+ELASTIC_CA_CERT.
 """
 import argparse
 import copy
 import json
-import os
-import re
 import sys
 from pathlib import Path
 
-import yaml
+from apphealth_lib import (CHECKS_MAPPING, ROOT, Client, components_mapping, load_settings,
+                           pipeline_body, template_purposes)
 
-ROOT = Path(__file__).resolve().parent
-GENERATED_TAG = "app-health-generated"
-TIME_FILTER = (
-    '{ts} >= NOW() - {max_lookback} '
-    'AND DATE_DIFF("minute", {ts}, NOW()) <= ?lookback_minutes'
-)
-LOOKBACK_PARAM = {
-    "type": "integer",
-    "description": "How many minutes back to look (e.g. 15, 60, 240, 1440). "
-                   "Use 60 unless the user asks for another window.",
-}
+TAG = "app-health"
 
 
-# --------------------------------------------------------------------------- config
-def load_config(apps_path, agent_path):
-    with open(agent_path) as f:
-        agent_cfg = yaml.safe_load(f)
-    with open(apps_path) as f:
-        apps_cfg = yaml.safe_load(f)
-    defaults = apps_cfg.get("defaults", {})
-    apps = []
-    seen = set()
-    for raw in apps_cfg.get("applications", []):
-        app = {**defaults, **raw}
-        app.setdefault("aliases", [])
-        app.setdefault("depends_on", [])
-        app.setdefault("log_indices", [])
-        app.setdefault("metric_indices", [])
-        app.setdefault("checks", [])
-        app["slug"] = slugify(app["id"])
-        if app["slug"] in seen:
-            sys.exit(f"duplicate application id: {app['id']}")
-        if not app["log_indices"] and not app["metric_indices"]:
-            sys.exit(f"application {app['id']} has no log_indices or metric_indices")
-        seen.add(app["slug"])
-        apps.append(app)
-    ids = {a["id"] for a in apps}
-    for app in apps:
-        for dep in app["depends_on"]:
-            if dep not in ids:
-                print(f"warning: {app['id']} depends_on unknown app '{dep}'", file=sys.stderr)
-    return agent_cfg, apps
-
-
-def slugify(value):
-    slug = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
-    if not slug or not slug[0].isalpha():
-        sys.exit(f"application id must start with a letter: {value!r}")
-    return slug
-
-
-# --------------------------------------------------------------------------- tools
-def esql_tool(tool_id, description, query, tags):
-    query = query.strip()
-    params = {}
-    if "?lookback_minutes" in query:
-        params["lookback_minutes"] = LOOKBACK_PARAM
-    return {
-        "id": tool_id,
-        "type": "esql",
-        "description": description.strip(),
-        "tags": tags,
-        "configuration": {"query": query, "params": params},
-    }
-
-
-def time_filter(app):
-    return TIME_FILTER.format(ts=app["timestamp_field"], max_lookback=app["max_lookback"])
-
-
-def build_app_tools(prefix, app):
-    ts, msg, host = app["timestamp_field"], app["message_field"], app["host_field"]
-    err, warn = app["error_condition"], app["warning_condition"]
-    tf = time_filter(app)
-    base = f"{prefix}.{app['slug']}"
-    tags = [GENERATED_TAG, f"app:{app['slug']}"]
-    name = app["display_name"]
-    tools = []
-
-    if app["log_indices"]:
-        logs = ", ".join(app["log_indices"])
-        tools.append(esql_tool(
-            f"{base}.health_summary",
-            f"HEALTH CHECK for {name} (app id '{app['id']}'). Per host: total log "
-            f"lines, errors, warnings, error rate and minutes since the last log line, "
-            f"over the lookback window. Reads only: {logs}. A host with a large "
-            f"minutes_since_last_event is silent (possibly down).",
-            f"""
-FROM {logs}
-| WHERE {tf}
-| EVAL is_error = CASE(({err}), 1, 0), is_warning = CASE(({warn}), 1, 0)
-| STATS total_events = COUNT(*), errors = SUM(is_error), warnings = SUM(is_warning),
-        last_event = MAX({ts})
-    BY {host}
-| EVAL error_rate_pct = ROUND(errors * 100.0 / total_events, 2),
-       minutes_since_last_event = DATE_DIFF("minute", last_event, NOW())
-| SORT errors DESC
-| LIMIT 100
-""", tags))
-
-        if app["error_grouping"] == "categorize":
-            group = f"error_pattern = CATEGORIZE({msg})"
-        else:
-            group = "error_pattern"
-        pre_group = "" if app["error_grouping"] == "categorize" else \
-            f"| EVAL error_pattern = SUBSTRING(TO_STRING({msg}), 1, 200)\n"
-        tools.append(esql_tool(
-            f"{base}.find_errors",
-            f"FIND ISSUES in {name} (app id '{app['id']}'). Top error messages grouped "
-            f"by pattern with count, first/last seen and number of affected hosts. "
-            f"Use for 'any issues/errors/exceptions' and as the first step of root cause "
-            f"analysis. Reads only: {logs}.",
-            f"""
-FROM {logs}
-| WHERE {tf}
-| WHERE ({err})
-{pre_group}| STATS occurrences = COUNT(*), first_seen = MIN({ts}), last_seen = MAX({ts}),
-        affected_hosts = COUNT_DISTINCT({host})
-    BY {group}
-| SORT occurrences DESC
-| LIMIT 25
-""", tags))
-
-        tools.append(esql_tool(
-            f"{base}.error_timeline",
-            f"TIMELINE for {name} (app id '{app['id']}'): events, errors and warnings per "
-            f"{app['timeline_bucket']} bucket. Use to find WHEN a problem started "
-            f"(root cause) and whether it is ongoing. Keep lookback <= 1440. "
-            f"Reads only: {logs}.",
-            f"""
-FROM {logs}
-| WHERE {tf}
-| EVAL is_error = CASE(({err}), 1, 0), is_warning = CASE(({warn}), 1, 0)
-| STATS events = COUNT(*), errors = SUM(is_error), warnings = SUM(is_warning)
-    BY bucket = BUCKET({ts}, {app['timeline_bucket']})
-| SORT bucket ASC
-| LIMIT 500
-""", tags))
-
-        tools.append({
-            "id": f"{base}.search_logs",
-            "type": "index_search",
-            "description": (
-                f"Free-text / natural-language search over {name} logs only "
-                f"({logs}). Use to look up specific exceptions, ids, topics, "
-                f"hosts or messages found during analysis."
-            ),
-            "tags": tags,
-            "configuration": {"pattern": ",".join(app["log_indices"])},
-        })
-
-    if app["metric_indices"]:
-        metrics = ", ".join(app["metric_indices"])
-        tools.append(esql_tool(
-            f"{base}.metrics_freshness",
-            f"Checks that {name} (app id '{app['id']}') metrics are still arriving: "
-            f"documents and minutes since last document per index over the lookback "
-            f"window. Reads only: {metrics}.",
-            f"""
-FROM {metrics} METADATA _index
-| WHERE {tf}
-| STATS docs = COUNT(*), last_doc = MAX({ts}) BY _index
-| EVAL minutes_since_last_doc = DATE_DIFF("minute", last_doc, NOW())
-| SORT minutes_since_last_doc DESC
-| LIMIT 50
-""", tags))
-
-    for check in app["checks"]:
-        query = check["query"]
-        for key, val in {
-            "{logs}": ", ".join(app["log_indices"]),
-            "{metrics}": ", ".join(app["metric_indices"]),
-            "{time_filter}": tf,
-            "{ts}": ts,
-        }.items():
-            query = query.replace(key, val)
-        tools.append(esql_tool(
-            f"{base}.{slugify(check['id'])}",
-            f"{name} (app id '{app['id']}') check: {check['description']}",
-            query, tags))
-    return tools
-
-
-def build_registry_tools(prefix, registry_index):
-    tags = [GENERATED_TAG, "app-registry"]
+def build_tools(s):
+    p, comp, checks = s["tool_prefix"], s["components_index"], s["checks_index"]
+    component_param = {"component": {
+        "type": "string",
+        "description": "The component id exactly as returned by list_components (lowercase).",
+    }}
     return [
-        esql_tool(
-            f"{prefix}.list_applications",
-            "ALWAYS CALL FIRST. Lists every monitored application with its app_id, "
-            "aliases, owner, dependencies, the indices that belong to it and the ids "
-            "of the tools to use for it. Use it to map the user's wording "
-            "(e.g. 'kafka brokers', 'zk') to an app_id.",
-            f"""
-FROM {registry_index}
-| KEEP app_id, display_name, aliases, description, owner, depends_on,
-       log_indices, metric_indices, tool_ids
-| SORT app_id
-| LIMIT 500
-""", tags),
+        {
+            "id": f"{p}.list_components",
+            "type": "esql",
+            "description": (
+                "ALWAYS CALL FIRST. Lists every application/component in the component "
+                "table: id, display name, aliases, owner, dependencies and which signals "
+                "(logs/metrics/traces) it has. Use it to map the user's wording "
+                "(e.g. 'kafka brokers', 'zk', 'payments') to a component id."),
+            "tags": [TAG],
+            "configuration": {"query": f"""FROM {comp}
+| EVAL signals = TRIM(CONCAT(
+    CASE(MV_COUNT(log_indices) > 0, "logs ", ""),
+    CASE(MV_COUNT(metric_indices) > 0, "metrics ", ""),
+    CASE(MV_COUNT(trace_indices) > 0, "traces", "")))
+| KEEP component, display_name, aliases, description, owner, depends_on, signals
+| SORT component
+| LIMIT 1000""", "params": {}},
+        },
+        {
+            "id": f"{p}.get_component",
+            "type": "esql",
+            "description": (
+                "Returns one component's row: its log/metric/trace indices, filters, "
+                "field names (resolved.*) and its READY-TO-RUN ES|QL queries (queries.*). "
+                "Call after list_components, and for each depends_on component during "
+                "root-cause analysis."),
+            "tags": [TAG],
+            "configuration": {"query": f"""FROM {comp}
+| WHERE component == TO_LOWER(?component)
+| KEEP component, display_name, description, owner, depends_on, schema, service_name,
+       log_indices, metric_indices, trace_indices, notes, resolved.*, queries.*
+| LIMIT 1""", "params": copy.deepcopy(component_param)},
+        },
+        {
+            "id": f"{p}.get_component_checks",
+            "type": "esql",
+            "description": (
+                "Returns the custom ES|QL health checks registered for one component "
+                "(e.g. Kafka consumer lag). Run each one during a health check."),
+            "tags": [TAG],
+            "configuration": {"query": f"""FROM {checks}
+| WHERE component == TO_LOWER(?component)
+| KEEP check_id, description, query
+| SORT check_id
+| LIMIT 50""", "params": copy.deepcopy(component_param)},
+        },
     ]
 
 
-def registry_docs(apps, tools_by_app):
-    return [{
-        "app_id": app["id"],
-        "display_name": app["display_name"],
-        "aliases": app["aliases"],
-        "description": app.get("description", ""),
-        "owner": app.get("owner", ""),
-        "depends_on": app["depends_on"],
-        "log_indices": app["log_indices"],
-        "metric_indices": app["metric_indices"],
-        "tool_ids": [t["id"] for t in tools_by_app[app["id"]]],
-    } for app in apps]
-
-
-REGISTRY_MAPPING = {
-    "mappings": {
-        "dynamic": "strict",
-        "properties": {
-            "app_id": {"type": "keyword"},
-            "display_name": {"type": "keyword"},
-            "aliases": {"type": "keyword"},
-            "description": {"type": "text"},
-            "owner": {"type": "keyword"},
-            "depends_on": {"type": "keyword"},
-            "log_indices": {"type": "keyword"},
-            "metric_indices": {"type": "keyword"},
-            "tool_ids": {"type": "keyword"},
-        },
-    },
-}
-
-
-# --------------------------------------------------------------------------- agent
 INSTRUCTIONS = """\
-You are the Application Health Agent. You answer questions about the health,
-issues and root cause of problems in specific applications (for example Kafka)
-using ONLY the Elasticsearch indices registered for that application.
+You are the App Health Agent. You answer questions about the health, issues and
+root cause of problems of specific applications/components (Kafka, ZooKeeper,
+services...) using ONLY the indices registered for that component in the
+component table. Its logs, metrics and traces come from OpenTelemetry (or ECS).
 
 ## Hard rules
-1. Never search the whole cluster. Never query an index that is not listed for the
-   application in `{prefix}.list_applications`.
-2. Always start by calling `{prefix}.list_applications` and resolve the user's
-   wording to exactly one `app_id` (match on app_id, display_name or aliases).
-   If nothing matches, say so and list the available applications. If several
-   match, ask which one they mean.
-3. Tool ids have the form `{prefix}.<app>.<check>`. Only use the tools whose ids appear in that application's `tool_ids`
-   (and those of its `depends_on` apps during root-cause analysis).
-4. If you use `platform.core.execute_esql` or `platform.core.get_index_mapping`,
-   the FROM clause / index MUST be one of the app's `log_indices` or
-   `metric_indices`, and you must always include a time filter and a LIMIT.
-5. Default lookback is {default_lookback} minutes unless the user asks for another
-   window ("last 4 hours" -> 240, "today"/"last day" -> 1440).
-6. Base every statement on tool results. Quote numbers, hosts and timestamps.
-   If a tool errors (e.g. index or field not found) or returns no rows, say
-   exactly that - "no data" is itself a finding (the app may be down or not shipping logs).
+1. Never search the whole cluster. Never query an index that is not in the
+   component's log_indices, metric_indices or trace_indices.
+2. Always start with `{p}.list_components` and map the user's wording to exactly
+   one component id (match id, display_name or aliases, case-insensitive).
+   No match: say so and list the available components. Several matches: ask.
+3. Then call `{p}.get_component` for that id. It returns ready-to-run ES|QL in
+   `queries.<name>` and custom checks via `{p}.get_component_checks`.
+4. Run those queries with `platform.core.execute_esql`, copying them EXACTLY and
+   only replacing the placeholders:
+     {{MINUTES}}  lookback in minutes (default {lookback}; "last 4 hours" -> 240,
+                "today"/"last day" -> 1440, "last week" -> 10080)
+     {{TEXT}}     words to search for (exception class, id, topic, host...)
+     {{TRACE_ID}} a trace id taken from trace_errors / log results
+   Only write your own ES|QL if no stored query fits; then use the same indices,
+   the component's filter from `resolved.<signal>_filter`, field names from
+   `resolved.*`, a time filter and a LIMIT. Use `platform.core.get_index_mapping`
+   only on the component's own indices.
+5. Base every statement on query results; quote numbers, hosts, timestamps.
+   A query error (unknown index/column) or zero rows is a finding: report it
+   (e.g. "no logs from kafka in the last 60 minutes - it may be down or not shipping").
+6. Run independent queries in parallel where possible and keep answers concise.
+
+## Stored queries (a null queries.<name> means the component lacks that signal)
+{purposes}
 
 ## Workflows
-**Health check** ("how is kafka", "health of X", "is X ok"):
- - Run `{prefix}.<app>.health_summary`, `{prefix}.<app>.metrics_freshness` (if present) and every
-   app-specific check tool (e.g. consumer_lag). Run `{prefix}.<app>.find_errors` if errors > 0.
- - Answer with: overall status (HEALTHY / DEGRADED / DOWN) with a one-line reason,
-   a short table of key numbers, top issues, and recommended next steps.
- - Guide: DOWN = no recent data at all or all hosts silent > 15 min;
-   DEGRADED = error rate > 5%, a silent host, rising errors, or a failing check;
-   otherwise HEALTHY.
+**Health check** ("health of X", "is X ok", "status of X"):
+ - Run log_health, metric_freshness, trace_summary (whichever exist) and every
+   custom check. If errors > 0 also run log_errors (and trace_errors).
+ - Answer: status HEALTHY / DEGRADED / DOWN with a one-line reason, a small table
+   of key numbers per host/operation, top issues, and recommended next steps.
+ - DOWN = no data in the window, or every host silent > 15 min.
+   DEGRADED = error rate > 5%, any host silent > 15 min (minutes_since_last_event),
+   stale metrics, trace error rate > 5% or p95 clearly abnormal, or a failing
+   custom check. Otherwise HEALTHY.
 
-**Find issues** ("any issues/errors in X"):
- - Run `{prefix}.<app>.find_errors`, then `{prefix}.<app>.error_timeline` for the top patterns' window.
- - List issues ranked by impact (occurrences, affected hosts, still ongoing?).
+**Find issues** ("any issues/errors/problems in X"):
+ - Run log_errors and trace_errors, then log_timeline for the same window.
+ - List issues ranked by impact: occurrences, affected hosts, ongoing or resolved.
 
-**Root cause analysis** ("why is X failing", "root cause"):
- 1. `{prefix}.<app>.error_timeline` to find when errors/volume changed (the onset time).
- 2. `{prefix}.<app>.find_errors` around the onset; identify the earliest new error pattern.
- 3. `{prefix}.<app>.search_logs` for that pattern / exception to get concrete examples.
- 4. Check the app-specific checks and metrics for the same window.
- 5. For each app in `depends_on`, run its health_summary and find_errors for the
-    same window - an upstream failure that started first is a likely cause.
+**Root cause analysis** ("why is X failing/slow", "root cause", "what happened"):
+ 1. log_timeline / trace_timeline: find when errors, volume or latency changed (onset).
+ 2. log_errors / trace_errors over a window starting shortly before the onset;
+    identify the earliest new error pattern.
+ 3. log_search for that pattern, and log_by_trace for an example_trace_id,
+    to get concrete evidence.
+ 4. Custom checks and metric_freshness for the same window.
+ 5. For each component in depends_on: get_component, then log_health and
+    log_errors for the same window. An upstream problem that began first is a
+    likely cause. (Also mention components that depend on X, from list_components,
+    if they are affected.)
  6. Report: timeline of events, most likely root cause with evidence, confidence
-    (high/medium/low), what else could explain it, and concrete next steps.
-    Clearly separate evidence from hypothesis.
-
-## Known applications
-{catalog}
+    (high/medium/low), alternatives, and concrete next steps. Separate evidence
+    from hypothesis.
 """
 
 
-def build_agent(agent_cfg, apps, tool_ids):
-    prefix = agent_cfg["tool_prefix"]
-    catalog = "\n".join(
-        f"- `{a['id']}` ({a['display_name']}); aliases: {', '.join(a['aliases']) or '-'}"
-        for a in apps
-    )
-    a = agent_cfg["agent"]
-    instructions = INSTRUCTIONS.format(
-        prefix=prefix,
-        default_lookback=agent_cfg.get("default_lookback_minutes", 60),
-        catalog=catalog,
-    )
+def build_agent(s):
+    p = s["tool_prefix"]
+    purposes = "\n".join(f"- `{name}`: {text}" for name, text in template_purposes(s).items())
+    a = s["agent"]
+    tool_ids = [t["id"] for t in build_tools(s)] + s.get("platform_tools", [])
     return {
         "id": a["id"],
         "name": a["name"],
@@ -339,267 +159,147 @@ def build_agent(agent_cfg, apps, tool_ids):
         "avatar_color": a.get("avatar_color"),
         "avatar_symbol": a.get("avatar_symbol"),
         "configuration": {
-            "instructions": instructions,
-            "tools": [{"tool_ids": tool_ids + agent_cfg.get("extra_platform_tools", [])}],
+            "instructions": INSTRUCTIONS.format(p=p, lookback=s.get("default_lookback_minutes", 60),
+                                                purposes=purposes),
+            "tools": [{"tool_ids": tool_ids}],
         },
     }
 
 
-def build_all(agent_cfg, apps):
-    prefix = agent_cfg["tool_prefix"]
-    tools_by_app = {app["id"]: build_app_tools(prefix, app) for app in apps}
-    registry_tools = build_registry_tools(prefix, agent_cfg["registry_index"])
-    tools = registry_tools + [t for app in apps for t in tools_by_app[app["id"]]]
-    ids = [t["id"] for t in tools]
-    dupes = {i for i in ids if ids.count(i) > 1}
-    if dupes:
-        sys.exit(f"duplicate tool ids: {sorted(dupes)}")
-    return {
-        "tools": tools,
-        "agent": build_agent(agent_cfg, apps, ids),
-        "registry": registry_docs(apps, tools_by_app),
-        "role": build_role(agent_cfg, apps),
-    }
-
-
-def build_role(agent_cfg, apps):
-    indices = sorted({i for a in apps for i in a["log_indices"] + a["metric_indices"]})
-    return {
-        "cluster": ["monitor"],
-        "indices": [
-            {"names": indices + [agent_cfg["registry_index"]],
-             "privileges": ["read", "view_index_metadata"]},
-        ],
-    }
-
-
 # --------------------------------------------------------------------------- render
-def update_body(obj, drop):
-    body = copy.deepcopy(obj)
-    for key in drop:
-        body.pop(key, None)
-    return body
+def render(s, out):
+    out.mkdir(parents=True, exist_ok=True)
+    tools, agent = build_tools(s), build_agent(s)
+    (out / "tools.json").write_text(json.dumps(tools, indent=2))
+    (out / "agent.json").write_text(json.dumps(agent, indent=2))
+    (out / "agent_instructions.md").write_text(agent["configuration"]["instructions"])
 
-
-def render(bundle, agent_cfg, out_dir):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "tools.json").write_text(json.dumps(bundle["tools"], indent=2))
-    (out_dir / "agent.json").write_text(json.dumps(bundle["agent"], indent=2))
-    (out_dir / "registry.json").write_text(json.dumps(bundle["registry"], indent=2))
-    (out_dir / "agent_instructions.md").write_text(
-        bundle["agent"]["configuration"]["instructions"])
-
-    space = agent_cfg.get("kibana_space", "default")
+    space = s.get("kibana_space", "default")
     kbn = "kbn:" if space == "default" else f"kbn:/s/{space}"
-    reg = agent_cfg["registry_index"]
-    lines = [
-        "# Kibana Dev Tools script generated by setup_agent.py",
-        "# Paste into Kibana > Dev Tools > Console and run top to bottom.",
-        "# Re-running: the POST for an existing tool/agent fails with 409;",
-        "# run the matching PUT (commented below each POST) instead.",
+    idx, chk = s["components_index"], s["checks_index"]
+    comp_body = components_mapping()
+    comp_body["settings"] = {"index": {"default_pipeline": f"{idx}-render"}}
+    L = [
+        "# Generated by setup_agent.py render - paste into Kibana > Dev Tools > Console.",
+        "# Run the sections in order. POST of an existing tool/agent returns 409:",
+        "# use the commented PUT instead (body without id/type).",
         "",
-        "# ---- 1. App registry index",
-        f"DELETE {reg}",
-        "",
-        f"PUT {reg}",
-        json.dumps(REGISTRY_MAPPING, indent=2),
-        "",
-        f"POST {reg}/_bulk?refresh=true",
+        "# ---- 1. Pipeline that renders each component's queries",
+        f"PUT _ingest/pipeline/{idx}-render", json.dumps(pipeline_body(s), indent=2), "",
+        "# ---- 2. Component table + checks table (skip if they already exist)",
+        f"PUT {idx}", json.dumps(comp_body, indent=2), "",
+        f"PUT {chk}", json.dumps(CHECKS_MAPPING, indent=2), "",
+        "# ---- 3. Add components (one PUT per component; re-PUT to change it)",
+        f"PUT {idx}/_doc/kafka?refresh=true",
+        json.dumps({"component": "kafka", "display_name": "Apache Kafka",
+                    "aliases": ["kafka cluster", "brokers"], "service_name": "kafka",
+                    "log_indices": ["logs-*.otel-*"], "metric_indices": ["metrics-*.otel-*"],
+                    "depends_on": ["zookeeper"], "owner": "messaging-team"}, indent=2), "",
+        f"GET {idx}/_doc/kafka   # check the rendered queries", "",
+        "# Custom check example ({MINUTES} is filled in by the agent)",
+        f"PUT {chk}/_doc/kafka__consumer_lag?refresh=true",
+        json.dumps({"component": "kafka", "check_id": "consumer_lag",
+                    "description": "Consumer lag per group/topic",
+                    "query": "FROM metrics-*.otel-*\n| WHERE @timestamp >= NOW() - {MINUTES} minutes "
+                             "AND resource.attributes.service.name == \"kafka\"\n"
+                             "| STATS max_lag = MAX(metrics.kafka.consumer_group.lag) "
+                             "BY attributes.group, attributes.topic\n| SORT max_lag DESC\n| LIMIT 25"},
+                   indent=2), "",
+        "# ---- 4. Agent Builder tools",
     ]
-    for doc in bundle["registry"]:
-        lines.append(json.dumps({"index": {"_id": doc["app_id"]}}))
-        lines.append(json.dumps(doc))
-    lines += ["", "# ---- 2. Tools"]
-    for tool in bundle["tools"]:
-        lines += [f"POST {kbn}/api/agent_builder/tools", json.dumps(tool, indent=2)]
-        lines += [f"# PUT {kbn}/api/agent_builder/tools/{tool['id']}  (body without id/type)", ""]
-    agent = bundle["agent"]
-    lines += ["# ---- 3. Agent",
-              f"POST {kbn}/api/agent_builder/agents", json.dumps(agent, indent=2), "",
-              f"# To update later:",
-              f"# PUT {kbn}/api/agent_builder/agents/{agent['id']}  (body without id)", "",
-              "# ---- 4. (Optional) role for chat users: read-only on registered indices only",
-              "# Add Kibana privileges (Agent Builder + Actions/Connectors) in",
-              "# Stack Management > Roles after creating it.",
-              "PUT _security/role/app_health_agent_user", json.dumps(bundle["role"], indent=2), ""]
-    (out_dir / "devtools_console.txt").write_text("\n".join(lines))
-    print(f"wrote {len(bundle['tools'])} tools, agent and registry to {out_dir}/")
+    for t in tools:
+        L += [f"POST {kbn}/api/agent_builder/tools", json.dumps(t, indent=2),
+              f"# PUT {kbn}/api/agent_builder/tools/{t['id']}", ""]
+    L += ["# ---- 5. Agent", f"POST {kbn}/api/agent_builder/agents", json.dumps(agent, indent=2),
+          f"# PUT {kbn}/api/agent_builder/agents/{agent['id']}", ""]
+    (out / "devtools_console.txt").write_text("\n".join(L))
+    print(f"wrote {out}/devtools_console.txt, tools.json, agent.json, agent_instructions.md")
 
 
-# --------------------------------------------------------------------------- http
-class Client:
-    def __init__(self, agent_cfg, insecure=False):
-        import requests
-        self.requests = requests
-        self.kibana = env("KIBANA_URL").rstrip("/")
-        self.es = os.environ.get("ES_URL", "").rstrip("/")
-        space = agent_cfg.get("kibana_space", "default")
-        self.kbn_base = self.kibana + ("" if space == "default" else f"/s/{space}")
-        self.session = requests.Session()
-        self.session.headers.update({"kbn-xsrf": "true", "Content-Type": "application/json",
-                                     "elastic-api-version": "2023-10-31"})
-        if os.environ.get("ELASTIC_API_KEY"):
-            self.session.headers["Authorization"] = "ApiKey " + os.environ["ELASTIC_API_KEY"]
-        else:
-            self.session.auth = (env("ELASTIC_USERNAME"), env("ELASTIC_PASSWORD"))
-        if insecure:
-            self.session.verify = False
-            requests.packages.urllib3.disable_warnings()
-        elif os.environ.get("ELASTIC_CA_CERT"):
-            self.session.verify = os.environ["ELASTIC_CA_CERT"]
-
-    def call(self, method, url, body=None, ok=(200, 201), allow=()):
-        resp = self.session.request(method, url, data=None if body is None else json.dumps(body),
-                                    timeout=300)
-        if resp.status_code in allow:
-            return resp
-        if resp.status_code not in ok:
-            sys.exit(f"{method} {url} -> {resp.status_code}\n{resp.text[:2000]}")
-        return resp
-
-    def kbn(self, method, path, body=None, **kw):
-        return self.call(method, self.kbn_base + path, body, **kw)
-
-    def esr(self, method, path, body=None, **kw):
-        if not self.es:
-            sys.exit("ES_URL is required for the registry index")
-        return self.call(method, self.es + path, body, **kw)
-
-
-def env(name):
-    val = os.environ.get(name)
-    if not val:
-        sys.exit(f"environment variable {name} is required")
-    return val
-
-
-def upsert(client, kind, obj, immutable):
+# --------------------------------------------------------------------------- kibana
+def upsert(c, kind, obj, immutable):
     path = f"/api/agent_builder/{kind}/{obj['id']}"
-    exists = client.kbn("GET", path, ok=(200,), allow=(404,)).status_code == 200
+    exists = c.kbn("GET", path, ok=(200,), allow=(404,)).status_code == 200
+    body = {k: v for k, v in obj.items() if not (exists and k in immutable)}
     if exists:
-        client.kbn("PUT", path, update_body(obj, immutable))
-        print(f"  updated {kind[:-1]} {obj['id']}")
+        c.kbn("PUT", path, body)
     else:
-        client.kbn("POST", f"/api/agent_builder/{kind}", obj)
-        print(f"  created {kind[:-1]} {obj['id']}")
+        c.kbn("POST", f"/api/agent_builder/{kind}", body)
+    print(f"  {'updated' if exists else 'created'} {kind[:-1]} {obj['id']}")
 
 
-def generated_tool_ids(client, prefix):
-    data = client.kbn("GET", "/api/agent_builder/tools").json()
-    return [t["id"] for t in data.get("results", [])
-            if t["id"].startswith(prefix + ".") and GENERATED_TAG in t.get("tags", [])]
+def apply(c, s):
+    for idx in (s["components_index"], s["checks_index"]):
+        if c.esr("HEAD", f"/{idx}", ok=(200,), allow=(404,)).status_code == 404:
+            print(f"warning: index {idx} does not exist yet - run `python components.py init`",
+                  file=sys.stderr)
+    for tool in build_tools(s):
+        upsert(c, "tools", tool, immutable=("id", "type"))
+    agent = build_agent(s)
+    upsert(c, "agents", agent, immutable=("id",))
+    print(f"done. Kibana > Agents > '{agent['name']}'")
 
 
-def write_registry(client, index, docs):
-    client.esr("DELETE", f"/{index}", ok=(200,), allow=(404,))
-    client.esr("PUT", f"/{index}", REGISTRY_MAPPING)
-    bulk = "".join(json.dumps({"index": {"_id": d["app_id"]}}) + "\n" + json.dumps(d) + "\n"
-                   for d in docs)
-    resp = client.session.post(f"{client.es}/{index}/_bulk?refresh=true", data=bulk,
-                               headers={"Content-Type": "application/x-ndjson"}, timeout=60)
-    if resp.status_code != 200 or resp.json().get("errors"):
-        sys.exit(f"registry bulk failed: {resp.text[:2000]}")
-    print(f"  registry index '{index}' written ({len(docs)} apps)")
+def test(c, s):
+    rows = c.esr("POST", f"/{s['components_index']}/_search",
+                 {"size": 1, "sort": [{"component": "asc"}]}).json()["hits"]["hits"]
+    component = rows[0]["_source"]["component"] if rows else "kafka"
+    fails = 0
+    for tool in build_tools(s):
+        params = {"component": component} if tool["configuration"]["params"] else {}
+        resp = c.kbn("POST", "/api/agent_builder/tools/_execute",
+                     {"tool_id": tool["id"], "tool_params": params}, ok=(200,), allow=(400, 404, 500))
+        results = resp.json().get("results", []) if resp.status_code == 200 else []
+        error = resp.status_code != 200 or any(r.get("type") == "error" for r in results)
+        rows = [len(r["data"]["values"]) for r in results if isinstance(r.get("data"), dict)
+                and "values" in r["data"]]
+        fails += error
+        print(f"{'FAIL' if error else 'ok  '} {tool['id']:32} {params} "
+              f"{str(rows[0]) + ' rows' if rows else ''}")
+        if error:
+            print("     ", resp.text[:800])
+    return fails
 
 
-def apply(client, bundle, agent_cfg):
-    prefix = agent_cfg["tool_prefix"]
-    print("registry:")
-    write_registry(client, agent_cfg["registry_index"], bundle["registry"])
-    print("tools:")
-    wanted = {t["id"] for t in bundle["tools"]}
-    for tool in bundle["tools"]:
-        upsert(client, "tools", tool, immutable=("id", "type"))
-    print("agent:")
-    upsert(client, "agents", bundle["agent"], immutable=("id",))
-    stale = [i for i in generated_tool_ids(client, prefix) if i not in wanted]
-    for tool_id in stale:
-        client.kbn("DELETE", f"/api/agent_builder/tools/{tool_id}")
-        print(f"  deleted stale tool {tool_id}")
-    print("done. Open Kibana > Agents and pick "
-          f"'{bundle['agent']['name']}'.")
-
-
-def test(client, bundle, lookback):
-    failures = 0
-    for tool in bundle["tools"]:
-        params = {}
-        if tool["type"] == "esql" and "lookback_minutes" in tool["configuration"]["params"]:
-            params["lookback_minutes"] = lookback
-        if tool["type"] == "index_search":
-            params["query"] = "error"
-        resp = client.kbn("POST", "/api/agent_builder/tools/_execute",
-                          {"tool_id": tool["id"], "tool_params": params},
-                          ok=(200,), allow=(400, 404, 500))
-        text = resp.text
-        bad = resp.status_code != 200 or '"type":"error"' in text.replace(" ", "")
-        failures += bad
-        rows = ""
-        try:
-            for res in resp.json().get("results", []):
-                vals = res.get("data", {}).get("values")
-                if vals is not None:
-                    rows = f"{len(vals)} rows"
-        except ValueError:
-            pass
-        print(f"{'FAIL' if bad else 'ok  '} {tool['id']:55} {rows}")
-        if bad:
-            print("      " + text[:600].replace("\n", " "))
-    print(f"\n{len(bundle['tools']) - failures}/{len(bundle['tools'])} tools ok")
-    return failures
-
-
-def ask(client, agent_id, question):
-    resp = client.kbn("POST", "/api/agent_builder/converse",
-                      {"agent_id": agent_id, "input": question})
-    data = resp.json()
+def ask(c, s, question):
+    data = c.kbn("POST", "/api/agent_builder/converse",
+                 {"agent_id": s["agent"]["id"], "input": question}).json()
     for step in data.get("steps", []):
         if step.get("type") == "tool_call":
-            print(f"[tool] {step.get('tool_id')} {json.dumps(step.get('params', {}))}")
-    print()
-    print(data.get("response", {}).get("message", json.dumps(data, indent=2)))
+            params = json.dumps(step.get("params", {}))
+            print(f"[tool] {step.get('tool_id')} {params[:300]}")
+    print("\n" + data.get("response", {}).get("message", json.dumps(data, indent=2)))
 
 
-def destroy(client, bundle, agent_cfg):
-    client.kbn("DELETE", f"/api/agent_builder/agents/{bundle['agent']['id']}",
-               ok=(200,), allow=(404,))
-    for tool_id in generated_tool_ids(client, agent_cfg["tool_prefix"]):
-        client.kbn("DELETE", f"/api/agent_builder/tools/{tool_id}")
-        print(f"deleted tool {tool_id}")
-    client.esr("DELETE", f"/{agent_cfg['registry_index']}", ok=(200,), allow=(404,))
-    print("agent, tools and registry removed")
+def destroy(c, s):
+    c.kbn("DELETE", f"/api/agent_builder/agents/{s['agent']['id']}", ok=(200,), allow=(404,))
+    for tool in build_tools(s):
+        c.kbn("DELETE", f"/api/agent_builder/tools/{tool['id']}", ok=(200,), allow=(404,))
+    print("agent and tools deleted (component table kept; delete the indices yourself if wanted)")
 
 
-# --------------------------------------------------------------------------- main
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("command", choices=["render", "apply", "test", "ask", "destroy"])
-    p.add_argument("question", nargs="?", help="question for the 'ask' command")
-    p.add_argument("--apps", default=ROOT / "config" / "apps.yaml")
-    p.add_argument("--agent-config", default=ROOT / "config" / "agent.yaml")
-    p.add_argument("--out", default=ROOT / "out", type=Path)
-    p.add_argument("--lookback", type=int, default=60, help="minutes, for 'test'")
+    p.add_argument("question", nargs="?")
+    p.add_argument("--out", type=Path, default=ROOT / "out")
     p.add_argument("--insecure", action="store_true", help="skip TLS verification")
-    args = p.parse_args()
-
-    agent_cfg, apps = load_config(args.apps, args.agent_config)
-    bundle = build_all(agent_cfg, apps)
-
-    if args.command == "render":
-        render(bundle, agent_cfg, args.out)
+    a = p.parse_args()
+    s = load_settings()
+    if a.command == "render":
+        render(s, a.out)
         return
-    client = Client(agent_cfg, insecure=args.insecure)
-    if args.command == "apply":
-        apply(client, bundle, agent_cfg)
-    elif args.command == "test":
-        sys.exit(1 if test(client, bundle, args.lookback) else 0)
-    elif args.command == "ask":
-        if not args.question:
+    c = Client(s, insecure=a.insecure, need_kibana=True)
+    if a.command == "apply":
+        apply(c, s)
+    elif a.command == "test":
+        sys.exit(1 if test(c, s) else 0)
+    elif a.command == "ask":
+        if not a.question:
             sys.exit('usage: setup_agent.py ask "how healthy is kafka?"')
-        ask(client, bundle["agent"]["id"], args.question)
-    elif args.command == "destroy":
-        destroy(client, bundle, agent_cfg)
+        ask(c, s, a.question)
+    elif a.command == "destroy":
+        destroy(c, s)
 
 
 if __name__ == "__main__":

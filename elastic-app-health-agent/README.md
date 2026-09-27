@@ -1,125 +1,183 @@
 # App Health Agent for Kibana Agent Builder (Elastic 9.4)
 
-An agent for the Kibana **Agent Builder** chat. You ask things like
-*"how healthy is Kafka?"*, *"any issues in payments in the last 4 hours?"* or
-*"root cause of the Kafka errors since 10:00"*. The agent works out which
-application you mean, looks up **that application's indices**, and runs checks
-only against those indices. It never searches the whole cluster.
+Ask the Kibana **Agent Builder** chat things like:
+
+- *"health check of kafka"*
+- *"any issues in payments in the last 4 hours?"*
+- *"why is payments-api failing? find the root cause"*
+
+The agent looks the application up in a **component table** (an Elasticsearch
+index you maintain), finds the indices that hold that component's **logs, metrics
+and traces**, and runs its checks **only on those indices**. It never searches
+the whole cluster.
+
+Adding an application means adding one row to the table. You don't touch or
+redeploy the agent.
 
 ## How it works
 
 ```
-User: "is kafka ok?"
-   │
-   ▼
-App Health Agent  (custom instructions: resolve app → only use its tools)
-   │ 1. apphealth.list_applications ──► index "app-health-registry"
-   │        kafka → logs-kafka.log-*, metrics-kafka.*-*, depends_on: zookeeper
-   │ 2. apphealth.kafka.health_summary      (ES|QL, logs-kafka.log-* only)
-   │ 3. apphealth.kafka.metrics_freshness   (ES|QL, metrics-kafka.*-* only)
-   │ 4. apphealth.kafka.consumer_lag        (custom check from apps.yaml)
-   │ 5. apphealth.kafka.find_errors         (if errors > 0)
-   ▼
-"DEGRADED: broker-2 silent for 23 min, 4.1% error rate, consumer group X lag 1.2M..."
+ you: "is kafka ok?"
+        │
+        ▼
+ App Health Agent ── 1. apphealth.list_components ──► app-health-components (the table)
+        │                "kafka" / "brokers" / "event bus" → component "kafka"
+        │          ── 2. apphealth.get_component("kafka")
+        │                 log_indices, metric_indices, trace_indices,
+        │                 filters (service.name == "kafka") and READY-TO-RUN queries
+        │          ── 3. apphealth.get_component_checks("kafka")  (custom checks, e.g. consumer lag)
+        │          ── 4. platform.core.execute_esql  × (log_health, metric_freshness, consumer_lag, ...)
+        ▼
+ "DEGRADED - broker-2 has sent no logs for 24 min; 12% errors 'Shrinking ISR ...';
+  consumer group payments lag peaked at 89,812 ..."
 ```
 
-| Piece | What it is |
+| Piece | Purpose |
 |---|---|
-| `config/apps.yaml` | **The catalog.** Maps each app → its log/metric indices, aliases, owner, dependencies, field names, and custom checks. This is the file you edit. |
-| `config/agent.yaml` | Agent name/id, Kibana space, tool prefix, extra built-in tools. |
-| `app-health-registry` index | Written from `apps.yaml`. The agent reads it to map a name ("zk", "kafka brokers") to an app and its indices. |
-| Generated tools (per app) | `health_summary`, `find_errors`, `error_timeline`, `search_logs` (index-scoped search), `metrics_freshness`, plus one tool per custom `check`. Every tool has its index pattern **hard-coded**, so it can only read that app's data. |
-| Agent | Instructions with three workflows (health check, find issues, root cause), including checking upstream `depends_on` apps during root-cause analysis. |
+| `app-health-components` index | **The table.** One row per component with its log/metric/trace indices, OTel `service.name`, aliases, owner, `depends_on`. |
+| `app-health-components-render` ingest pipeline | Runs on every write to the table. It checks the row and generates the component's ready-to-run ES\|QL queries (`queries.*`) from `config/query_templates.yaml`. Rows added from Dev Tools get queries too. |
+| `app-health-checks` index | Optional custom ES\|QL checks per component (Kafka consumer lag, etc.). |
+| 3 agent tools | `list_components`, `get_component`, `get_component_checks`. They stay the same however many apps you add. |
+| `platform.core.execute_esql` | Runs the stored queries. |
+| `components.py` | CLI to manage the table: add, import/export CSV, checks, validate, role. |
+| `setup_agent.py` | Deploys the tools and the agent to Kibana. |
 
-## Setup
+### Stored queries per component
 
-### 1. Prerequisites
-- Elastic 9.4 with Agent Builder enabled and an LLM connector (you already have this).
-- A user or API key that can manage Agent Builder tools/agents and create an
-  index (`app-health-registry`). A superuser is fine for the first setup.
-- Python 3.9+ on any machine that can reach Kibana and Elasticsearch:
-  `pip install -r requirements.txt`
-  *(No Python on the network? Use option B in step 3.)*
+| Signal | Queries |
+|---|---|
+| logs | `log_health` (per host: events, errors, warnings, error rate, minutes since last log), `log_errors` (top error patterns), `log_timeline` (5-min buckets), `log_search` (text search), `log_by_trace` (all logs of a trace) |
+| metrics | `metric_freshness` (are metrics still arriving, per index) |
+| traces | `trace_summary` (per operation: calls, errors, avg/p95 ms), `trace_errors` (failing spans + example trace id), `trace_timeline` |
 
-### 2. Describe your applications in `config/apps.yaml`
-For each app, fill in `log_indices` / `metric_indices` with the patterns you
-actually use (check in **Discover** or `GET _cat/indices/*kafka*?v`), and add aliases.
-If your logs are not ECS, override `host_field`, `message_field` or
-`error_condition` for that app (see the `payments-api` example).
+Field names default to **OpenTelemetry-native** data as stored by Elastic
+(`logs-*.otel-*`, `traces-*.otel-*`, `metrics-*.otel-*`): `severity_number`,
+`body.text`, `resource.attributes.service.name`, `resource.attributes.host.name`,
+span `duration` (ns), `status.code`, `trace_id`. Set `schema: ecs` on a row for
+Filebeat/ECS or Elastic APM data. You can also override any single field on a row.
 
-The Kafka example assumes the Elastic **Kafka integration** data streams
-(`logs-kafka.log-*`, `metrics-kafka.consumergroup-*`, `metrics-kafka.partition-*`).
-If you ship Kafka data differently, change the index patterns and field names
-in its `checks`.
+## Setup (once)
 
-### 3. Deploy
-
-**Option A: script (recommended)**
 ```bash
-export KIBANA_URL=https://kibana.mycorp.local:5601
+pip install -r requirements.txt
+
 export ES_URL=https://es.mycorp.local:9200
-export ELASTIC_API_KEY=<base64 id:key>      # or ELASTIC_USERNAME / ELASTIC_PASSWORD
-export ELASTIC_CA_CERT=/path/to/ca.crt      # on-prem self-signed CA
+export KIBANA_URL=https://kibana.mycorp.local:5601
+export ELASTIC_API_KEY=<base64 id:key>          # or ELASTIC_USERNAME / ELASTIC_PASSWORD
+export ELASTIC_CA_CERT=/etc/pki/elastic-ca.crt  # on-prem CA (or use --insecure)
 
-python setup_agent.py render   # optional: review ./out/*.json first
-python setup_agent.py apply    # registry + tools + agent (idempotent; removes stale tools)
-python setup_agent.py test     # runs every tool once and prints any ES|QL / field errors
-python setup_agent.py ask "What is the health of kafka?"
+python components.py init        # pipeline + component table + checks table
+python setup_agent.py apply      # 3 tools + the agent
+python setup_agent.py test       # runs the 3 tools through Kibana
 ```
 
-**Option B: Kibana Dev Tools, no network access from a script**
+Then open **Kibana → Agents → App Health Agent**. The agent uses your default
+LLM connector, or pick one in the chat.
+
+> Can't run Python against the cluster? Run `python setup_agent.py render` anywhere
+> and paste `out/devtools_console.txt` into **Kibana → Dev Tools**.
+
+## Adding your applications
+
+### One at a time
 ```bash
-python setup_agent.py render      # can run on a laptop, no cluster access needed
+python components.py add kafka \
+  --display-name "Apache Kafka" \
+  --aliases "kafka cluster, brokers, event bus" \
+  --service-name kafka \
+  --log-indices "logs-*.otel-*" \
+  --metric-indices "metrics-*.otel-*" \
+  --depends-on zookeeper \
+  --owner messaging-team
+
+python components.py add payments-api --service-name payments-api \
+  --log-indices "logs-*.otel-*" --trace-indices "traces-*.otel-*" --depends-on kafka
 ```
-Paste `out/devtools_console.txt` into **Kibana → Dev Tools → Console** and run it
-top to bottom.
+`add` on an existing component only changes the fields you pass.
 
-### 4. Use it
-Kibana → **Agents** (Agent Builder) → choose **App Health Agent** → ask:
+`--service-name` makes every query filter on
+`resource.attributes.service.name == "<name>"`. This matters because the OTel
+exporter usually writes all services into the same data streams
+(e.g. `logs-generic.otel-default`). If a component needs a different filter,
+set it directly, for example:
+`--log-filter 'resource.attributes.host.name LIKE "kafka-*"'` or
+`--metric-filter 'resource.attributes.service.name IN ("kafka", "kafka-jmx")'`.
 
-- `health check of kafka`
-- `any issues with zookeeper in the last 4 hours?`
-- `why are payments failing? find the root cause`
-- `show kafka consumer lag for the last day`
-- `which apps can you check?`
+### Many at once (CSV)
+```bash
+python components.py export components.csv    # edit in Excel / a text editor
+python components.py import components.csv     # adds or replaces rows by component id
+```
+See `config/components.example.csv`. List columns (`aliases`, `depends_on`,
+`*_indices`) take `;`-separated values.
 
-### 5. (Recommended) Enforce the index boundary with a role
-Every generated tool can only read its own index patterns. The optional built-in
-tools `platform.core.execute_esql` and `get_index_mapping` (used for deeper RCA)
-are held to the registered indices by the agent's instructions only, and tools
-run with the chat user's own permissions. For a hard guarantee, have chat users
-use the role at the end of `out/devtools_console.txt` (`app_health_agent_user`:
-read-only on the registered indices). Add the Kibana privileges for Agent Builder
-and Connectors to that role in **Stack Management → Roles**.
-You can also remove those two tools from `extra_platform_tools` in `agent.yaml`.
+### From Kibana Dev Tools (no script)
+```
+PUT app-health-components/_doc/zookeeper?refresh=true
+{
+  "component": "zookeeper",
+  "aliases": ["zk"],
+  "service_name": "zookeeper",
+  "log_indices": ["logs-*.otel-*"],
+  "depends_on": []
+}
+```
+The pipeline generates the queries. `GET app-health-components/_doc/zookeeper` shows them.
 
-## Adding a new application
-1. Add a block to `config/apps.yaml` (id, aliases, indices, optional `checks`).
-2. Run `python setup_agent.py apply && python setup_agent.py test`.
+### Custom checks
+```bash
+python components.py add-check kafka consumer_lag \
+  --description "Consumer lag per group/topic; high or growing = consumers falling behind" \
+  --query-file kafka_lag.esql
+python components.py import-checks config/checks.example.yaml
+```
+Write `{MINUTES}` where the time window goes, and the agent fills it in:
+`WHERE @timestamp >= NOW() - {MINUTES} minutes AND resource.attributes.service.name == "kafka"`.
+Use the metric names your OTel receiver emits. Check them with
+`GET metrics-*.otel-*/_mapping` or in Discover.
 
-A custom check is any ES|QL query. These placeholders are filled in for you:
-`{time_filter}` (driven by the `lookback_minutes` parameter the agent passes),
-`{ts}`, `{logs}` and `{metrics}`.
+### Always validate
+```bash
+python components.py validate            # every query of every component
+python components.py validate kafka --minutes 240
+```
+This runs every stored query and check against your real data, and shows
+`Unknown index`, `Unknown column` or bad-filter errors before a user hits them in chat.
 
-```yaml
-checks:
-  - id: under_replicated_partitions
-    description: Brokers reporting under-replicated partitions.
-    query: |
-      FROM metrics-kafka.broker-*
-      | WHERE {time_filter}
-      | STATS max_urp = MAX(kafka.broker.<your_urp_field>) BY host.name
-      | WHERE max_urp > 0
-      | LIMIT 20
+### Other commands
+`list`, `show NAME` (row + rendered queries + checks), `remove NAME`,
+`remove-check NAME ID`, `rerender` (after editing `config/query_templates.yaml`,
+run `init` then `rerender`).
+
+## Restricting who can use it, and what it can read
+```bash
+python components.py role      # creates role app_health_agent_user
+```
+The role gives read access to the registered indices and the two tables, plus
+Kibana **Agent Builder: read** and **Actions and Connectors: read**. Assign it
+(or map your LDAP/AD group to it) for the users who should use the agent. Tools
+run with the chat user's permissions, so even ad-hoc ES|QL from the agent can't
+read other indices. Re-run `role` after adding components with new index patterns.
+I checked this on 9.4.6: a user with this role got `Unknown index` when querying
+an unregistered index through the agent's ES|QL tool.
+
+## Files
+```
+components.py              manage the component table (CLI)
+setup_agent.py             deploy tools + agent to Kibana
+apphealth_lib.py           shared code: pipeline, mappings, HTTP client
+config/agent.yaml          agent name, index names, tool prefix, role features
+config/query_templates.yaml  ES|QL templates and OTel/ECS field presets
+config/components.example.csv, config/checks.example.yaml   examples
 ```
 
 ## Troubleshooting
-- **`test` shows `Unknown index`**: the index pattern in `apps.yaml` matches nothing.
-- **`Unknown column [log.level]`**: that app's logs don't have the field. Override
-  `error_condition` or `warning_condition` for the app, e.g.
-  `'message LIKE "*ERROR*"'`.
-- **`CATEGORIZE` errors**: set `error_grouping: truncate` for that app.
-- **Non-default Kibana space**: set `kibana_space` in `agent.yaml`.
-- **Agent answers about other indices**: remove `platform.core.execute_esql`
-  from `extra_platform_tools` and apply the role from step 5.
-- `python setup_agent.py destroy` removes the agent, the generated tools and the registry index.
+- **`Unknown column [severity_number]`** (or similar): that component isn't
+  OTel-native. Set `--schema ecs` or override `--error-condition`, `--host-field`, etc.
+- **`Unknown index`**: the pattern matches nothing. Check `GET _cat/indices/logs-*otel*?v`.
+- **0 rows but data exists**: the filter is wrong. Check the `service.name` value in
+  Discover, or set `--log-filter`.
+- **`MATCH` errors in `log_search`**: the message field must be a text field;
+  override `--message-field`.
+- **Non-default Kibana space**: set `kibana_space` in `config/agent.yaml`.
+- `python setup_agent.py destroy` removes the agent and its tools. The table is kept.

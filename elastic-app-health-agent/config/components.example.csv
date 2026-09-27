@@ -1,0 +1,5 @@
+component,display_name,aliases,description,owner,depends_on,schema,service_name,log_indices,log_filter,metric_indices,metric_filter,trace_indices,trace_filter,timestamp_field,host_field,message_field,service_field,error_condition,warning_condition,trace_id_field,notes
+kafka,Apache Kafka,kafka cluster; brokers; event bus,Production Kafka brokers,messaging-team,zookeeper,otel,kafka,logs-*.otel-*,,metrics-kafka.otel-*,,,,,,,,,,,
+zookeeper,Apache ZooKeeper,zk,ZooKeeper ensemble used by Kafka,messaging-team,,otel,zookeeper,logs-*.otel-*,,,,,,,,,,,,,
+payments-api,Payments API,payments; payment service,Card payments REST service,payments-team,kafka,otel,payments-api,logs-*.otel-*,,,,traces-*.otel-*,,,,,,,,,
+legacy-billing,Legacy Billing,billing,Old Filebeat-shipped app (ECS fields),billing-team,,ecs,,filebeat-*,"log.file.path LIKE ""*/billing/*""",,,,,,,,,,,,Example of a non-OTel app filtered by log file path
