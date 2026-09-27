@@ -1,0 +1,93 @@
+# Application catalog: which indices belong to which application.
+#
+# This is the ONLY place you need to edit to add/change an application.
+# Re-run `python setup_agent.py apply` afterwards.
+#
+# Field names below default to ECS (Elastic Common Schema). Override per app if
+# your data uses different fields.
+
+defaults:
+  timestamp_field: "@timestamp"
+  message_field: message
+  host_field: host.name
+  # ES|QL boolean expressions evaluated per log line.
+  error_condition: 'TO_LOWER(log.level) IN ("error", "fatal", "critical", "severe")'
+  warning_condition: 'TO_LOWER(log.level) IN ("warn", "warning")'
+  # How errors are grouped by the find_errors tool:
+  #   truncate   -> first 200 chars of the message (works everywhere)
+  #   categorize -> ES|QL CATEGORIZE() pattern clustering (better grouping)
+  error_grouping: truncate
+  timeline_bucket: 5 minutes
+  # Upper bound on how far back any generated query reads (keeps queries cheap).
+  max_lookback: 7 days
+
+applications:
+
+  # ---------------------------------------------------------------- Kafka ---
+  - id: kafka
+    display_name: Apache Kafka
+    aliases: [kafka, kafka cluster, kafka brokers, broker, event bus, messaging]
+    description: Production Kafka cluster (brokers, topics, consumer groups).
+    owner: platform-messaging-team
+    depends_on: [zookeeper]          # used by the agent for root-cause analysis
+    log_indices:
+      - logs-kafka.log-*
+    metric_indices:
+      - metrics-kafka.*-*
+    # Extra app-specific checks. Each becomes its own ES|QL tool.
+    # Placeholders: {logs} {metrics} {time_filter} {ts}
+    # {time_filter} expands to a WHERE clause driven by ?lookback_minutes.
+    checks:
+      - id: consumer_lag
+        description: >-
+          Kafka consumer lag per consumer group and topic (max and latest)
+          over the lookback window. High or growing lag = consumers falling behind.
+        query: |
+          FROM metrics-kafka.consumergroup-*
+          | WHERE {time_filter}
+          | STATS max_lag = MAX(kafka.consumergroup.consumer_lag),
+                  avg_lag = AVG(kafka.consumergroup.consumer_lag),
+                  last_seen = MAX({ts})
+              BY kafka.consumergroup.id, kafka.topic.name
+          | SORT max_lag DESC
+          | LIMIT 25
+      - id: partition_offsets
+        description: >-
+          Topic/partition offset movement over the lookback window. A partition
+          whose newest offset does not move is not receiving messages.
+        query: |
+          FROM metrics-kafka.partition-*
+          | WHERE {time_filter}
+          | STATS min_offset = MIN(kafka.partition.offset.newest),
+                  max_offset = MAX(kafka.partition.offset.newest)
+              BY kafka.topic.name, kafka.partition.id
+          | EVAL messages_in_window = max_offset - min_offset
+          | SORT messages_in_window ASC
+          | LIMIT 50
+
+  # ------------------------------------------------------------ ZooKeeper ---
+  - id: zookeeper
+    display_name: Apache ZooKeeper
+    aliases: [zookeeper, zk]
+    description: ZooKeeper ensemble used by Kafka.
+    owner: platform-messaging-team
+    depends_on: []
+    log_indices:
+      - logs-zookeeper.log-*
+    metric_indices:
+      - metrics-zookeeper.*-*
+
+  # ------------------------------------------- Example custom application ---
+  # Delete or adapt. Shows overriding fields for non-ECS / custom log formats.
+  - id: payments-api
+    display_name: Payments API
+    aliases: [payments, payment service, payments api]
+    description: Java Spring Boot payments service.
+    owner: payments-team
+    depends_on: [kafka]
+    log_indices:
+      - logs-payments-*
+    metric_indices: []
+    host_field: kubernetes.pod.name
+    error_condition: 'log.level == "ERROR" OR message LIKE "*Exception*"'
+    error_grouping: categorize
