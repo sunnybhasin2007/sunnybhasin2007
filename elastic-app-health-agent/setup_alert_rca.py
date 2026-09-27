@@ -82,6 +82,33 @@ def rca_index_name(a):
     return m.group(1)
 
 
+def active_workflow_id(c):
+    """Id of the deployed (not deleted) RCA workflow, or None.
+
+    Kibana soft-deletes workflows: GET by id still answers for a deleted one, but only
+    the list endpoint reflects what is really active, so look it up there.
+    """
+    found = c.kbn("GET", "/api/workflows?size=500").json().get("results", [])
+    ids = [w["id"] for w in found if w["id"] == WORKFLOW_ID or w["id"].startswith(WORKFLOW_ID + "-")]
+    return ids[0] if ids else None
+
+
+def free_workflow_id(c):
+    """A deleted workflow's id cannot be reused, so pick alert-rca, alert-rca-2, ..."""
+    for n in range(1, 100):
+        wid = WORKFLOW_ID if n == 1 else f"{WORKFLOW_ID}-{n}"
+        if c.kbn("GET", f"/api/workflows/workflow/{wid}", ok=(200,), allow=(404,)).status_code == 404:
+            return wid
+    sys.exit("no free workflow id found")
+
+
+def require_workflow(c):
+    wid = active_workflow_id(c)
+    if not wid:
+        sys.exit("the RCA workflow is not deployed - run: python setup_alert_rca.py deploy ...")
+    return wid
+
+
 def deploy(c, a):
     index = rca_index_name(a)
     if c.esr("HEAD", f"/{index}", ok=(200,), allow=(404,)).status_code == 404:
@@ -92,30 +119,34 @@ def deploy(c, a):
         print(f"index {index}: exists (mapping updated)")
 
     yaml_text = render_yaml(a)
-    path = f"/api/workflows/workflow/{WORKFLOW_ID}"
-    existing = c.kbn("GET", path, ok=(200,), allow=(404,))
-    if existing.status_code == 404:
-        c.kbn("POST", "/api/workflows/workflow", {"yaml": yaml_text, "id": WORKFLOW_ID})
-        action = "created"
-    else:
-        c.kbn("PUT", path, {"yaml": yaml_text})
+    wid = active_workflow_id(c)
+    if wid:
+        c.kbn("PUT", f"/api/workflows/workflow/{wid}", {"yaml": yaml_text})
         action = "updated"
-    wf = c.kbn("GET", path).json()
+    else:
+        wid = free_workflow_id(c)
+        c.kbn("POST", "/api/workflows/workflow", {"yaml": yaml_text, "id": wid})
+        action = "created"
+        if wid != WORKFLOW_ID:
+            print(f"note: id '{WORKFLOW_ID}' belongs to a deleted workflow, using '{wid}'")
+    wf = c.kbn("GET", f"/api/workflows/workflow/{wid}").json()
     if not wf.get("valid"):
         sys.exit(f"workflow {action} but Kibana marked it INVALID - open Kibana > Workflows > "
-                 f"{WORKFLOW_ID} to see the error")
-    print(f"workflow {WORKFLOW_ID}: {action}, valid, enabled={wf.get('enabled')}")
+                 f"'{wf.get('name')}' to see the error")
+    print(f"workflow {wid}: {action}, valid, enabled={wf.get('enabled')}")
     print("It runs every minute. Watch it in Kibana > Workflows > 'Alert root-cause analysis' > Executions.")
 
 
 def set_enabled(c, enabled):
-    c.kbn("PUT", f"/api/workflows/workflow/{WORKFLOW_ID}", {"enabled": enabled})
-    print(f"workflow {WORKFLOW_ID}: {'enabled' if enabled else 'disabled'}")
+    wid = require_workflow(c)
+    c.kbn("PUT", f"/api/workflows/workflow/{wid}", {"enabled": enabled})
+    print(f"workflow {wid}: {'enabled' if enabled else 'disabled'}")
 
 
 def status(c, a):
-    ex = c.kbn("GET", f"/api/workflows/workflow/{WORKFLOW_ID}/executions").json().get("results", [])
-    print("last executions:")
+    wid = require_workflow(c)
+    ex = c.kbn("GET", f"/api/workflows/workflow/{wid}/executions").json().get("results", [])
+    print(f"workflow {wid} - last executions:")
     for e in ex[:10]:
         print(f"  {e.get('startedAt', '')[:19]}  {e.get('status', ''):10} {e.get('triggeredBy', '')}")
     rows = c.esr("POST", f"/{rca_index_name(a)}/_search", {
@@ -148,7 +179,7 @@ def main():
     if a.command == "deploy":
         deploy(c, a)
     elif a.command == "run-now":
-        r = c.kbn("POST", f"/api/workflows/workflow/{WORKFLOW_ID}/run", {"inputs": {}}).json()
+        r = c.kbn("POST", f"/api/workflows/workflow/{require_workflow(c)}/run", {"inputs": {}}).json()
         print(f"started execution {r.get('workflowExecutionId')} - check with: python setup_alert_rca.py status")
     elif a.command == "status":
         status(c, a)
