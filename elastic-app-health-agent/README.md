@@ -14,6 +14,25 @@ the whole cluster.
 Adding an application means adding one row to the table. You don't touch or
 redeploy the agent.
 
+## Quick start (end to end, one script)
+
+1. Put your components and their indices in a CSV (start from `config/components.minimal.csv`):
+   ```csv
+   component,log_indices,metric_indices,trace_indices
+   kafka,logs-kafka.otel-*,metrics-kafka.otel-*,
+   payments-api,logs-payments_api.otel-*,,traces-payments_api.otel-*
+   ```
+   Several patterns in one cell: separate them with `;`. Optional extra columns:
+   `aliases`, `depends_on`, `owner`, `description`, and `service_name` if a component shares indices with others.
+2. Run:
+   ```bash
+   export ES_URL=https://es:9200 KIBANA_URL=https://kibana:5601 ELASTIC_API_KEY=...   # + ELASTIC_CA_CERT
+   ./quickstart.sh my_components.csv            # optional 2nd arg: checks YAML
+   ```
+   It creates the table, loads your CSV, validates every query on your data, deploys the
+   agent and tools to Kibana, tests them and creates the read-only role.
+3. Kibana → Agents → **App Health Agent** → ask anything about a component.
+
 ## How it works
 
 ```

@@ -1,0 +1,4 @@
+component,log_indices,metric_indices,trace_indices
+kafka,logs-kafka.otel-*,metrics-kafka.otel-*,
+zookeeper,logs-zookeeper.otel-*,,
+payments-api,logs-payments_api.otel-*,,traces-payments_api.otel-*
