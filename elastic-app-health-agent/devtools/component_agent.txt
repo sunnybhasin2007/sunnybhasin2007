@@ -18,15 +18,23 @@ POST kbn:/api/agent_builder/tools
   }
 }
 
-# ---- Agent
+# ---- Agent (for an existing agent use: PUT kbn:/api/agent_builder/agents/component-agent  with the same body minus "id")
 POST kbn:/api/agent_builder/agents
 {
   "id": "component-agent",
   "name": "Component Agent",
-  "description": "Answers questions about a component using only that component's indices.",
+  "description": "Answers questions about a component using only that component's indices (logs, traces and metrics).",
   "configuration": {
-    "instructions": "For any question about a component: 1) call registry.component_indices with the component name; if nothing is found, say so. 2) Answer using ONLY the indices it returns: check their fields with platform.core.get_index_mapping, then query with platform.core.execute_esql (always a time filter and a LIMIT). Never query any other index and never search the whole cluster. 3) Quote the numbers, hosts and times you found, and say which indices you used.",
-    "tools": [{ "tool_ids": ["registry.component_indices", "platform.core.get_index_mapping", "platform.core.execute_esql"] }]
+    "instructions": "You answer questions about one component at a time, using ONLY that component's own indices.\n1) Call registry.component_indices with the component name as the user wrote it. If nothing is found, say so and stop.\n2) The tool returns ALL indices of the component: logs-* (logs), traces-* (traces) and metrics-* (metrics). Check EVERY returned index, not only logs. For each index, first call platform.core.get_index_mapping to learn its field names, then run at least one query on it with platform.core.execute_esql:\n   - logs: errors/warnings over time (severity_text, severity_number) and the most frequent error messages (body.text)\n   - traces: number of spans, failed spans (status.code == \"Error\") and p95 duration by span name\n   - metrics: whether data is still arriving (latest @timestamp) and which metrics changed\n3) ES|QL rules: write index names in FROM exactly as returned and WITHOUT backticks (correct: FROM logs-generic.otel-mdsg ; wrong: FROM `logs-generic.otel-mdsg`). Backticks are only for field names. Always filter on @timestamp for the time window and add a LIMIT. Only use field names that exist in the mapping.\n4) If a query fails, read the error, fix the query and retry once. If an index really does not exist, name it in the answer.\n5) Never query an index the tool did not return, and never search the whole cluster.\n6) Answer per signal (logs / traces / metrics) with numbers, hosts and times, and list the indices you used.",
+    "tools": [
+      {
+        "tool_ids": [
+          "registry.component_indices",
+          "platform.core.get_index_mapping",
+          "platform.core.execute_esql"
+        ]
+      }
+    ]
   }
 }
 

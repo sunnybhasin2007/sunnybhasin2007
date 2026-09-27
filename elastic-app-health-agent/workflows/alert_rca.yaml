@@ -226,6 +226,9 @@ steps:
                 Otherwise:
                 1. Look the component up with your component lookup tool and use ONLY the
                    indices it returns (plus those of components it depends on, if listed).
+                   Check EVERY returned index - logs-*, traces-* and metrics-* - not only logs;
+                   read each index's field names with the index mapping tool first.
+                   Write index names in FROM without backticks (FROM logs-generic.otel-mdsg).
                 2. Alert time: {{ foreach.item[2] }}   Current time: {{ execution.startedAt | date: "%Y-%m-%dT%H:%M:%S%:z" }}
                    Cause: analyse from 30 minutes before the alert time until now - errors,
                    error rate, latency, volume changes and silent hosts, and when they started.
